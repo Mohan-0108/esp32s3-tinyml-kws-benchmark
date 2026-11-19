@@ -25,8 +25,8 @@ constexpr int kHistoryBufferSize = 32768;
 constexpr int kHistoryBufferMask = kHistoryBufferSize - 1;
 
 // INMP441 outputs 24-bit audio in a 32-bit slot.
-// Shift by 15 gives ~2x digital gain (reduces room-noise masking).
-constexpr int kAudioGainShift = 15;
+// Shift by 16 = 1x native 16-bit scaling (change to 15 if speech peaks stay < 0.85).
+constexpr int kAudioGainShift = 16;
 
 int16_t g_history_buffer[kHistoryBufferSize] = {0};
 int16_t g_audio_output_buffer[kMaxAudioSampleSize] = {0};
@@ -42,6 +42,8 @@ void CaptureSamplesTask(void* arg) {
   (void)arg;
   int32_t raw_buf[kChunkSamples];
   size_t bytes_read = 0;
+  int32_t prev_x = 0;
+  int32_t prev_y = 0;
 
   while (true) {
     esp_err_t ret = i2s_channel_read(g_rx_handle, raw_buf, sizeof(raw_buf),
@@ -51,11 +53,16 @@ void CaptureSamplesTask(void* arg) {
       int64_t write_pos = g_total_samples_captured;
 
       for (int i = 0; i < count; ++i) {
-        int32_t scaled = raw_buf[i] >> kAudioGainShift;
-        if (scaled > 32767) scaled = 32767;
-        if (scaled < -32768) scaled = -32768;
+        int32_t x = raw_buf[i] >> kAudioGainShift;
+        // 1st-order DC-blocking high-pass filter (fc ~ 80 Hz at 16 kHz)
+        int32_t y = (x - prev_x) + (prev_y * 31) / 32;
+        prev_x = x;
+        prev_y = y;
+
+        if (y > 32767) y = 32767;
+        if (y < -32768) y = -32768;
         g_history_buffer[(write_pos + i) & kHistoryBufferMask] =
-            static_cast<int16_t>(scaled);
+            static_cast<int16_t>(y);
       }
 
       portENTER_CRITICAL(&g_audio_mux);
@@ -100,7 +107,7 @@ void InitAudioRecording() {
                           5, nullptr, 1);
 
   g_is_audio_initialized = true;
-  ESP_LOGW(kTag, "INMP441 live audio initialized on Core 1 (16 kHz mono)");
+  ESP_LOGW(kTag, "INMP441 live audio + 80 Hz HPF initialized on Core 1");
 }
 
 }  // namespace
