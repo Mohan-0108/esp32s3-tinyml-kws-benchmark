@@ -1,51 +1,60 @@
-# Deterministic TinyML Keyword Spotting Benchmark on ESP32-S3
+# Real-Time TinyML Keyword Spotting Benchmark on ESP32-S3
 
-An I/O-decoupled, microsecond-precision benchmarking harness for evaluating TensorFlow Lite Micro (`esp-tflite-micro`) inference latency on the **ESP32-S3** microcontroller using **ESP-IDF v5.3.1**.
+An end-to-end, microsecond-precision benchmarking harness and live I2S deployment of TensorFlow Lite Micro (`esp-tflite-micro`) Keyword Spotting (`micro_speech`) on the ESP32-S3 microcontroller using ESP-IDF v5.3.1.
 
-## 1. Overview & Scope
-- **Target Hardware:** Heltec Wireless Tracker (ESP32-S3 @ 240 MHz, 8 MB QIO Flash, 320 KB Internal SRAM, no onboard microphone)
-- **Framework:** ESP-IDF v5.3.1 (`espressif/esp-tflite-micro` v1.4.1, `espressif/esp-nn` v1.4.1)
-- **Model:** Espressif `micro_speech` example (`TinyConv` 4-op graph: `DepthwiseConv2D`, `FullyConnected`, `Softmax`, `Reshape`; 30 KB static `tensor_arena`). *Note: This is Espressif's default KWS example, distinct from the larger MLPerf Tiny DS-CNN reference model.*
-- **Latency Isolation:** Replaces blocking I2S microphone reads (`i2s_readsamples`) with a deterministic **Dummy Audio Provider** (`+20 ms` stride + `vTaskDelay(20 ms)` to keep Native USB alive) and wraps `esp_timer_get_time()` (1-us resolution) strictly around `interpreter->Invoke()`.
+## 1. Overview & Architecture
 
-## 2. Experimental Results: Dummy Baseline vs. Live INMP441 (`real-mic-v1`)
+* **Target Hardware:** Heltec Wireless Tracker (ESP32-S3 Dual-Core Xtensa LX7 @ 240 MHz, 8 MB QIO Flash, 320 KB Internal SRAM)
+* **Audio Sensor:** External INMP441 Omnidirectional I2S MEMS Microphone (24-bit word in 32-bit slot, 16 kHz Mono Left)
+  * **Pinout:** `VDD → 3V3`, `GND → GND`, `L/R → GND`, `WS → GPIO 17`, `SCK → GPIO 7`, `SD → GPIO 6`
+* **Framework:** ESP-IDF v5.3.1 (`espressif/esp-tflite-micro` v1.4.1, `espressif/esp-nn` v1.4.1 SIMD acceleration)
+* **Model:** Quantized INT8 `micro_speech` TinyConv CNN (4-op graph: `DepthwiseConv2D`, `FullyConnected`, `Softmax`, `Reshape`; classes: `silence`, `unknown`, `yes`, `no`). *Note: This is Espressif's compact KWS model, distinct from the larger MLPerf Tiny DS-CNN reference model.*
+* **Dual-Core Real-Time Pipeline (`real-mic-v2`):**
+  * **Core 1 (`inmp41_capture`, Priority 5):** Continuously reads 20 ms DMA chunks (320 samples @ 16 kHz) via `i2s_std`, scales 24-bit words to native 16-bit PCM (`kAudioGainShift = 16`), applies a 1st-order integer **80 Hz DC-blocking high-pass filter** ($y[n] = (x[n] - x[n-1]) + \lfloor 31\,y[n-1] / 32 \rfloor$), and writes into a lock-protected 32,768-sample (~2.05 s) ring buffer with a 512-sample (32 ms) timestamp safety lag.
+  * **Core 0 (`app_main`):** Pulls 512-sample frames every 20 ms (50 Hz inference rate), computes 40-bin Log-Mel + PCAN spectrogram slices (`FeatureProvider`), runs INT8 `interpreter->Invoke()`, and applies temporal smoothing via `RecognizeCommands(300 ms, 0.72, 1200 ms, 3)`.
 
-| Metric (ESP32-S3 @ 240 MHz) | `baseline-v1` (Dummy, Pure Inf, $N=1{,}243$) | Dummy Full-Pipeline ($N=325$) | `real-mic-v1` (Live INMP441, $N=3{,}350$) | Interpretation |
+## 2. Latency & Resource Benchmarks (`baseline-v1` → `real-mic-v2`)
+
+| Metric (ESP32-S3 @ 240 MHz) | `baseline-v1` (Dummy, Pure Inf, $N=1{,}243$) | `real-mic-v1` (Live INMP441, No HPF, $N=3{,}350$) | `real-mic-v2` (Live + 80 Hz HPF, $N=8{,}550$) | Interpretation |
 | :--- | :--- | :--- | :--- | :--- |
-| **Cold-Start Feature Extraction (49 slices)** | — | 60,553 µs (60.55 ms) | **68,549 µs (68.55 ms)** | One-time initial spectrogram fill |
-| **Cold-Start Inference (Run #1)** | 3,761 µs (3.76 ms) | 3,782 µs (3.78 ms) | **3,776 µs (3.78 ms)** | SPI Flash (DROM) → 32 KB Data Cache warm-up |
-| **Steady-State Feature Extraction (1 slice)** | — | 1,261.85 ± 3.74 µs | **1,363.67 ± 6.20 µs** | +101.8 µs for active non-zero log-mel / PCAN math |
-| **Steady-State Pure Inference (`Invoke`)** | 3,121.43 ± 1.59 µs | 3,150.94 ± 1.67 µs | **3,132.52 ± 0.75 µs** | Sub-µs jitter — Core 1 I2S pinning isolates Core 0 |
-| **End-to-End Latency (`Feat + Inf + Post`)** | — | 4,412.79 µs (4.41 ms) | **4,571.34 ± 6.38 µs (4.57 ms)** | Full live pipeline including `RecognizeCommands` |
-| **20 ms Frame Duty Cycle** | 15.61% (Inf only) | 22.06% (`Feat + Inf`) | **22.86% (Full E2E)** | Leaves **77.14% (15.43 ms/frame)** CPU headroom |
-| **Configured / Peak Tensor Arena (SRAM)** | 30,720 B / — | 30,720 B / 12,052 B | **30,720 B / 12,048 B (11.77 KB)** | 39.2% actual utilization of static 30 KB arena |
-| **App Binary Size (Flash)** | 436,160 B (425.94 KB) | 436,480 B (426.25 KB) | **464,592 B (453.70 KB)** | +28.43 KB for `i2s_std` driver + live telemetry |
+| **Cold-Start Feature Extraction (49 slices)** | — | 68,549 µs (68.55 ms) | **67,364 µs (67.36 ms)** | One-time initial spectrogram fill |
+| **Cold-Start Inference (Run #1)** | 3,761 µs (3.76 ms) | 3,776 µs (3.78 ms) | **3,781 µs (3.78 ms)** | SPI Flash (DROM) → 32 KB Data Cache warm-up |
+| **Steady Feature Extraction (1 slice)** | — | 1,363.67 ± 6.20 µs | **1,359.19 ± 3.64 µs** | Deterministic band: 1,353–1,370 µs |
+| **Steady Pure Inference (`Invoke`)** | 3,121.43 ± 1.59 µs | 3,132.52 ± 0.75 µs | **3,140.71 ± 0.78 µs** | Sub-µs jitter — Core 1 I2S pinning isolates Core 0 |
+| **End-to-End Pipeline (`Feat + Inf + Post`)** | — | 4,571.34 ± 6.38 µs | **4,576.59 ± 3.99 µs (4.58 ms)** | Zero Core 0 latency penalty from Core 1 HPF |
+| **20 ms Frame Duty Cycle** | 15.61% (Inf only) | 22.86% (Full E2E) | **22.88% (Full E2E)** | Leaves **77.12% (15.42 ms/frame)** CPU headroom |
+| **Peak / Configured Tensor Arena (SRAM)** | — / 30,720 B | 12,048 / 30,720 B | **12,048 / 30,720 B (11.77 KB)** | 39.2% actual utilization of static 30 KB arena |
+| **App Binary Size (Flash)** | 436,160 B (425.94 KB) | 464,592 B (453.70 KB) | **464,624 B (453.73 KB)** | +32 bytes Flash overhead for 80 Hz HPF |
 
-> **Live Accuracy Status:** Preliminary ambient-room testing confirmed 9/10 recall on both `"yes"` and `"no"` (`0` false `"yes"` triggers), while identifying low-frequency room hum / DC offset causing false `"no"` triggers during silence. Controlled quiet-room accuracy benchmarks with a Core 1 80 Hz DC-blocking high-pass filter are pending in `real-mic-v2`.
+## 3. Live Quiet-Room Evaluation & Filter Ablation (`real-mic-v2`)
 
-## 3. How to Reproduce
+Evaluated continuously over **171 seconds** (8,550 steady-state frames) in a low-ambient indoor environment (~15 cm speaking distance): 35 s silence + 20 × `"yes"` + 20 × `"no"` + 10 × non-target (`"unknown"`) words.
+
+### 50-Utterance Confusion Matrix
+
+| Ground Truth \ Predicted | `"yes"` | `"no"` | Rejected (`sil` / `unk`) | Total Trials |
+| :--- | :---: | :---: | :---: | :---: |
+| **`"yes"`** | **18** | 0 | 2 | **20** |
+| **`"no"`** | 0 | **20** | 0 | **20** |
+| **`"unknown"`** | 0 | 3 *(4 raw triggers)* | **7** | **10** |
+| **Steady Silence (`1.5–35.0 s`)** | 0 | **0** *(+1 boot transient @ `0.75 s`)* | — | **33.5 s** |
+
+### Classification Metrics & Filter Impact
+
+| Metric | Utterance-Level (Steady-State) | Strict Event-Level (All 43 Triggers) |
+| :--- | :---: | :---: |
+| **`"yes"` Precision / Recall / F1** | **100.0% / 90.0% / 94.7%** | **100.0% / 90.0% / 94.7%** |
+| **`"no"` Precision / Recall / F1** | **87.0% / 100.0% / 93.0%** | **80.0% / 100.0% / 88.9%** |
+| **Target Keyword Macro-F1** | **93.9%** | **91.8%** |
+| **50-Utterance 3-Class Accuracy** | **45 / 50 (90.0%)** | — |
+| **Unknown Word Rejection Rate** | **7 / 10 (70.0%)** | — |
+| **Silence False-Alarm Rate (FPR/min)** | **0.00 FP/min** (`real-mic-v1`: 30.0 FP/min) | **1.71 FP/min** (incl. `0.75 s` boot transient) |
+
+* **Ablation Finding:** Unfiltered `real-mic-v1` (`kAudioGainShift = 15`, no HPF) suffered from INMP441 DC bias and low-frequency room hum energizing the lower Mel bins, causing **30.0 FP/min** false `"no"` triggers during silence. Adding the 80 Hz integer HPF on Core 1 (+32 B Flash, 0 µs Core 0 penalty) eliminated steady-state silence false alarms (**0.00 FP/min**) and `"yes"`/`"no"` cross-talk (**0%**).
+
+## 4. How to Reproduce
 
 ```powershell
 idf.py fullclean
 idf.py set-target esp32s3
 idf.py -p COM7 flash monitor
-```
-
-To parse the serial log into CSV and compute summary statistics:
-```powershell
-python scripts/parse_latency_log.py results/baseline_serial_log.txt results/baseline_latency.csv
-```
-
-## 4. Visual Plots & Documentation
-- Raw Serial Monitor Screenshot: `images/terminal_screenshot.png`
-- Cold-Start vs. Steady-State Stability Plot: `images/cache_and_stability.jpg`
-- Cache Warm-Up Callout Plot: `images/cache_callout_alt.jpg`
-- Real-Time Duty Cycle & Benchmark Plot: `images/duty_cycle_benchmarks.jpg`
-- Full Methodology Report (Word): `docs/TinyML_ESP32S3_Baseline_Report.docx`
-- 12-Slide Defense Presentation (PPTX): `docs/TinyML_ESP32S3_Baseline_Presentation.pptx`
-
-## 5. References
-
-1. C. Banbury et al., "MLPerf Tiny Benchmark," in *Proceedings of the Neural Information Processing Systems Track on Datasets and Benchmarks (NeurIPS Datasets and Benchmarks)*, vol. 1, 2021. [Online]. Available: https://datasets-benchmarks-proceedings.neurips.cc/paper_files/paper/2021/hash/da4fb5c6e93e74d3df8527599fa62642-Abstract-round1.html
-2. R. David et al., "TensorFlow Lite Micro: Embedded Machine Learning for TinyML Systems," in *Proceedings of Machine Learning and Systems (MLSys)*, vol. 3, pp. 800–811, 2021. [Online]. Available: https://proceedings.mlsys.org/paper_files/paper/2021/hash/6c44dc73014d66ba49b28d483a8f8b0d-Abstract.html
-3. J. Lin, W.-M. Chen, Y. Lin, J. Cohn, C. Gan, and S. Han, "MCUNet: Tiny Deep Learning on IoT Devices," in *Advances in Neural Information Processing Systems (NeurIPS)*, vol. 33, pp. 11711–11722, 2020. [Online]. Available: https://proceedings.neurips.cc/paper/2020/hash/86c51678350f656dcc7f490a43946ee5-Abstract.html
